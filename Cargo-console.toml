@@ -1,0 +1,23 @@
+[package]
+name = "vision-core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "webcam_capture"
+path = "src/bin/webcam_capture.rs"
+
+[[bin]]
+name = "face_detection"
+path = "src/bin/face_detection.rs"
+
+[[bin]]
+name = "webcamfull"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+image = "0.25"
+minifb = "0.27"
+ndarray = "0.16.1"
+ort = { version = "2.0.0-rc.10", features = ["ndarray"] }

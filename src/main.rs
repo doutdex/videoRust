@@ -4,10 +4,29 @@ use minifb::{Key, Window, WindowOptions};
 use ndarray::{Array2, Array4, Axis, Ix1, Ix2};
 use ort::session::Session;
 use ort::value::Tensor;
+use std::path::Path;
 
 // ---------------------------------------------------------
 // MODELOS
 // ---------------------------------------------------------
+
+const YUNET_ONNX: &str = "./models/yunet_n_640_640.onnx";
+const SCRFD_ONNX: &str = "./models/scrfd-det_10g.onnx";
+const ARCFACE_ONNX: &str = "./models/arcface.onnx";
+const POSE_DET_ONNX: &str = "./models/blazepose-pose_detection.onnx";
+const POSE_LM_ONNX: &str = "./models/blazepose-pose_landmarks_detector_full.onnx";
+
+const YUNET_INPUT_W: u32 = 640;
+const YUNET_INPUT_H: u32 = 640;
+const YUNET_IOU_THR: f32 = 0.45;
+const YUNET_TOPK_ENABLED: bool = true;
+const YUNET_TOPK: usize = 200;
+
+const SCRFD_INPUT_W: u32 = 640;
+const SCRFD_INPUT_H: u32 = 640;
+const SCRFD_IOU_THR: f32 = 0.45;
+const SCRFD_SOFT_NMS: bool = true;
+const SCRFD_SOFT_SIGMA: f32 = 0.5;
 
 enum FaceModel {
     YuNet,
@@ -29,27 +48,21 @@ impl Models {
 
         let (yunet, scrfd) = match face_model {
             FaceModel::YuNet => {
-                let s = Session::builder()?
-                    .commit_from_file("./models/yunet_n_640_640.onnx")?;
+                let s = Session::builder()?.commit_from_file(YUNET_ONNX)?;
                 (Some(s), None)
             }
             FaceModel::Scrfd => {
-                let s = Session::builder()?
-                   // .commit_from_file("./models/scrfd-det_2.5g.onnx")?;
-                    .commit_from_file("./models/scrfd-det_10g.onnx")?;
+                let s = Session::builder()?.commit_from_file(SCRFD_ONNX)?;
 
                 (None, Some(s))
             }
         };
 
-        let arcface = Session::builder()?
-            .commit_from_file("./models/arcface.onnx")?;
+        let arcface = Session::builder()?.commit_from_file(ARCFACE_ONNX)?;
 
-        let pose_det = Session::builder()?
-            .commit_from_file("./models/blazepose-pose_detection.onnx")?;
+        let pose_det = Session::builder()?.commit_from_file(POSE_DET_ONNX)?;
 
-        let pose_landmarks = Session::builder()?
-            .commit_from_file("./models/blazepose-pose_landmarks_detector_full.onnx")?;
+        let pose_landmarks = Session::builder()?.commit_from_file(POSE_LM_ONNX)?;
 
         Ok(Self {
             face_model,
@@ -274,15 +287,13 @@ fn draw_text(img: &mut RgbImage, x: f32, y: f32, text: &str, color: [u8; 3]) {
     }
 }
 
-fn show_image_with_detections(
+fn annotate_image(
     rgb: &RgbImage,
     faces: &[FaceDet],
     keypoints: &[[f32; 3]],
-    roi: Option<[f32; 4]>,
-    title: &str,
     show_facial_landmarks: bool,
     iou_thr: f32,
-) -> Result<()> {
+) -> RgbImage {
     let mut annotated = rgb.clone();
     for (idx, face) in faces.iter().enumerate() {
         draw_rect(&mut annotated, face.bbox, [255, 0, 0]);
@@ -306,59 +317,51 @@ fn show_image_with_detections(
             }
         }
     }
-    let _ = roi;
     for kp in keypoints {
         draw_point(&mut annotated, kp[0], kp[1], [0, 255, 0]);
     }
+    annotated
+}
+
+fn show_image_with_detections(
+    rgb: &RgbImage,
+    faces: &[FaceDet],
+    keypoints: &[[f32; 3]],
+    roi: Option<[f32; 4]>,
+    title: &str,
+    show_facial_landmarks: bool,
+    iou_thr: f32,
+) -> Result<()> {
+    let annotated = annotate_image(rgb, faces, keypoints, show_facial_landmarks, iou_thr);
+    let _ = roi;
 
     let (w, h) = annotated.dimensions();
-    let max_w = 1920u32;
-    let max_h = 1080u32;
-    let view_w = max_w;
-    let view_h = max_h;
+    let max_w = 1280u32;
+    let max_h = 720u32;
+    let view_w = w.min(max_w);
+    let view_h = h.min(max_h);
 
     let mut window = Window::new(title, view_w as usize, view_h as usize, WindowOptions::default())?;
+    let display = if w != view_w || h != view_h {
+        image::imageops::resize(&annotated, view_w, view_h, image::imageops::Triangle)
+    } else {
+        annotated
+    };
     let mut buffer: Vec<u32> = vec![0; (view_w * view_h) as usize];
-    let mut offset_x: i32 = 0;
-    let mut offset_y: i32 = 0;
+    for y in 0..view_h {
+        for x in 0..view_w {
+            let p = display.get_pixel(x, y);
+            let r = p[0] as u32;
+            let g = p[1] as u32;
+            let b = p[2] as u32;
+            buffer[(y * view_w + x) as usize] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
 
     while window.is_open() {
-        let step = if window.is_key_down(Key::LeftShift) { 50 } else { 10 };
-        let max_offset_x = (w as i32 - view_w as i32).max(0);
-        let max_offset_y = (h as i32 - view_h as i32).max(0);
-        if window.is_key_down(Key::Left) || window.is_key_down(Key::A) {
-            offset_x = (offset_x - step).max(0);
-        }
-        if window.is_key_down(Key::Right) || window.is_key_down(Key::D) {
-            offset_x = (offset_x + step).min(max_offset_x);
-        }
-        if window.is_key_down(Key::Up) || window.is_key_down(Key::W) {
-            offset_y = (offset_y - step).max(0);
-        }
-        if window.is_key_down(Key::Down) || window.is_key_down(Key::S) {
-            offset_y = (offset_y + step).min(max_offset_y);
-        }
         if window.is_key_down(Key::Escape) {
             break;
         }
-
-        for y in 0..view_h {
-            for x in 0..view_w {
-                let sx = (x as i32 + offset_x) as u32;
-                let sy = (y as i32 + offset_y) as u32;
-                let pixel = if sx < w && sy < h {
-                    let p = annotated.get_pixel(sx, sy);
-                    let r = p[0] as u32;
-                    let g = p[1] as u32;
-                    let b = p[2] as u32;
-                    (0xFF << 24) | (r << 16) | (g << 8) | b
-                } else {
-                    0xFF000000
-                };
-                buffer[(y * view_w + x) as usize] = pixel;
-            }
-        }
-
         window.update_with_buffer(&buffer, view_w as usize, view_h as usize)?;
     }
 
@@ -378,32 +381,32 @@ fn print_model_info(name: &str, path: &str, session: &Session) {
     }
 }
 
-fn print_face_model_details(model: &FaceModel) {
+fn print_face_model_details(model: &FaceModel, score_thr: f32, iou_thr: f32) {
     match model {
         FaceModel::YuNet => {
-    println!("DETECCION / YuNet");
-    println!("  ONNX: yunet_n_640_640.onnx");
-    println!("  PRE:");
-    println!("    - Input: 640x640, BGR");
-    println!("    - Normalizacion: ninguna");
-    println!("  POST:");
-    println!("    - Score: cls * obj");
-    println!("    - score_thr=0.02");
-    println!("    - TopK por nivel: enabled (200)");
-    println!("    - NMS: IoU=0.45");
+            println!("DETECCION / YuNet");
+            println!("  ONNX: {}", YUNET_ONNX);
+            println!("  PRE:");
+            println!("    - Input: {}x{}, BGR", YUNET_INPUT_W, YUNET_INPUT_H);
+            println!("    - Normalizacion: ninguna");
+            println!("  POST:");
+            println!("    - Score: cls * obj");
+            println!("    - score_thr={:.2}", score_thr);
+            println!("    - TopK por nivel: enabled ({})", YUNET_TOPK);
+            println!("    - NMS: IoU={:.2}", iou_thr);
         }
         FaceModel::Scrfd => {
-    println!("DETECCION / SCRFD");
-    println!("  ONNX: scrfd-det_2.5g.onnx");
-    println!("  PRE:");
-    println!("    - Input: resize+pad a 640x640");
-    println!("    - Normalizacion: (x - 127.5) / 128.0");
-    println!("  POST:");
-    println!("    - Score: salida directa del modelo");
-    println!("    - score_thr=0.5");
-    println!("    - Soft-NMS: enabled");
-    println!("      * IoU=0.45");
-    println!("      * sigma=0.5");
+            println!("DETECCION / SCRFD");
+            println!("  ONNX: {}", SCRFD_ONNX);
+            println!("  PRE:");
+            println!("    - Input: resize+pad a {}x{}", SCRFD_INPUT_W, SCRFD_INPUT_H);
+            println!("    - Normalizacion: (x - 127.5) / 128.0");
+            println!("  POST:");
+            println!("    - Score: salida directa del modelo");
+            println!("    - score_thr={:.2}", score_thr);
+            println!("    - Soft-NMS: {}", if SCRFD_SOFT_NMS { "enabled" } else { "disabled" });
+            println!("      * IoU={:.2}", iou_thr);
+            println!("      * sigma={:.2}", SCRFD_SOFT_SIGMA);
         }
     }
 }
@@ -414,6 +417,31 @@ struct CliArgs {
     show_facial_landmarks: bool,
     face_model: FaceModel,
     image_path: String,
+    score_thr: Option<f32>,
+    text_mode_json: bool,
+    text_mode_silent: bool,
+    stage_mode: StageMode,
+    out_file: Option<String>,
+    embedding_mode: EmbeddingMode,
+    out_img_detections: bool,
+}
+
+enum EmbeddingMode {
+    Off,
+    Raw,
+    QInt8,
+}
+
+enum StageMode {
+    Detection,
+    DetectionEmbedding,
+    EmbeddingOnly,
+    DetectionEmbeddingPose,
+}
+
+struct OutBundle {
+    run_id: String,
+    dir: std::path::PathBuf,
 }
 
 fn parse_args() -> CliArgs {
@@ -421,25 +449,35 @@ fn parse_args() -> CliArgs {
     let help = args.iter().any(|a| a == "-h" || a == "--help");
     if help {
         println!("Uso:");
-        println!("  picAnalizer [showUI] [showLandmarks] [showAll] [facemodel=1|2] [img=path]");
+        println!("  picAnalizer [uiShow] [showLandmarks] [showAll] [facemodel=1|2] [infile=path] [threshold=val] [textmode=json|0] [stages=1|11|01|111] [outfile=path|0] [embed=0|1|2]");
         println!();
         println!("Parametros:");
-        println!("  showUI                 Abre ventana con detecciones");
+        println!("  uiShow                 Abre ventana con detecciones");
         println!("  showLandmarks          Dibuja landmarks faciales (alias: showFacialLandmarks)");
         println!("  showAll                Muestra info de modelos y entradas/salidas");
-        println!("  facemodel=1|2          1=YuNet, 2=SCRFD");
-        println!("  img=path               Ruta de imagen (default: people1.jpg)");
+        println!("  facemodel=1|2          Selecciona modelo de cara: 1=YuNet, 2=SCRFD");
+        println!("  infile=path            Ruta de imagen (default: people.jpg)");
+        println!("  threshold=val          Umbral de score (default: 0.10 en model 1, 0.50 en model 2)");
+        println!("  textmode=json          Salida JSON (default: consola)");
+        println!("  textmode=0             Sin output (modo silent)");
+        println!("  stages=1|11|01|111       1=Detection, 11=Detection+Embedding, 01=Embedding, 111=Detection+Embedding+Pose");
+        println!("  outfile=path|0         Guarda imagen anotada (0 = no genera archivo)");
+        println!("  embed=0|1|2             Embedding en JSON: 0=off, 1=qint8 (default), 2=raw");
+        println!("  outDirDetections=1     Genera carpeta con in/out/json y crops de embedding");
         std::process::exit(0);
     }
 
-    let show_ui = args.iter().any(|a| a == "showUI" || a == "--showUI");
+    let show_ui = args
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case("uiShow") || a.eq_ignore_ascii_case("--uiShow"))
+        || args.len() == 1;
     let show_all = args.iter().any(|a| a == "showAll" || a == "--showAll");
     let show_facial_landmarks = args.iter().any(|a| {
-        a == "showFacialLandmarks"
-            || a == "--showFacialLandmarks"
-            || a == "showLandmarks"
-            || a == "--showLandmarks"
-    });
+        a.eq_ignore_ascii_case("showFacialLandmarks")
+            || a.eq_ignore_ascii_case("--showFacialLandmarks")
+            || a.eq_ignore_ascii_case("showLandmarks")
+            || a.eq_ignore_ascii_case("--showLandmarks")
+    }) || args.len() == 1;
     let face_model = args
         .iter()
         .find_map(|a| {
@@ -451,9 +489,48 @@ fn parse_args() -> CliArgs {
     let face_model = if face_model == 2 { FaceModel::Scrfd } else { FaceModel::YuNet };
     let image_path = args
         .iter()
-        .find_map(|a| a.strip_prefix("img=").or_else(|| a.strip_prefix("--img=")))
+        .find_map(|a| a.strip_prefix("infile=").or_else(|| a.strip_prefix("--infile=")))
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "people1.jpg".to_string());
+        .unwrap_or_else(|| "people.jpg".to_string());
+    let score_thr = args
+        .iter()
+        .find_map(|a| a.strip_prefix("threshold=").or_else(|| a.strip_prefix("--threshold=")))
+        .and_then(|v| v.parse::<f32>().ok());
+    let text_mode_json = args.iter().any(|a| a == "textmode=json" || a == "--textmode=json");
+    let text_mode_silent = args.iter().any(|a| a == "textmode=0" || a == "--textmode=0");
+    let stage_mode = args
+        .iter()
+        .find_map(|a| a.strip_prefix("stages=").or_else(|| a.strip_prefix("--stages=")))
+        .map(|v| v.trim().to_string())
+        .map(|v| match v.as_str() {
+            "1" => StageMode::Detection,
+            "11" => StageMode::DetectionEmbedding,
+            "01" => StageMode::EmbeddingOnly,
+            "111" => StageMode::DetectionEmbeddingPose,
+            _ => StageMode::DetectionEmbedding,
+        })
+        .unwrap_or(StageMode::DetectionEmbedding);
+    let out_file = args
+        .iter()
+        .find_map(|a| a.strip_prefix("outfile=").or_else(|| a.strip_prefix("--outfile=")))
+        .and_then(|v| {
+            if v == "0" {
+                None
+            } else {
+                Some(v.to_string())
+            }
+        });
+    let out_img_detections = args.iter().any(|a| a == "outDirDetections=1" || a == "--outDirDetections=1");
+    let embedding_mode = args
+        .iter()
+        .find_map(|a| a.strip_prefix("embed=").or_else(|| a.strip_prefix("--embed=")))
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| match v {
+            0 => EmbeddingMode::Off,
+            2 => EmbeddingMode::Raw,
+            _ => EmbeddingMode::QInt8,
+        })
+        .unwrap_or(EmbeddingMode::QInt8);
 
     CliArgs {
         show_ui,
@@ -461,6 +538,13 @@ fn parse_args() -> CliArgs {
         show_facial_landmarks,
         face_model,
         image_path,
+        score_thr,
+        text_mode_json,
+        text_mode_silent,
+        stage_mode,
+        out_file,
+        embedding_mode,
+        out_img_detections,
     }
 }
 
@@ -478,6 +562,199 @@ struct FaceDet {
     kps: Option<[[f32; 2]; 5]>,
 }
 
+struct DetectionMeta {
+    model_name: &'static str,
+    onnx_name: &'static str,
+    input_w: u32,
+    input_h: u32,
+    color: &'static str,
+    normalization: &'static str,
+    score_formula: &'static str,
+    score_thr: f32,
+    iou_thr: f32,
+    topk_enabled: bool,
+    topk: usize,
+    nms_type: &'static str,
+    soft_sigma: f32,
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn build_json_output(
+    meta: &DetectionMeta,
+    img_path: &str,
+    img_w: u32,
+    img_h: u32,
+    img_type: &str,
+    detect: &DetectResult,
+    faces: &[FaceDet],
+    embedding: Option<(u128, usize, usize)>,
+    embeddings: &[Vec<f32>],
+    pose: Option<(u128, u128, usize)>,
+    stage_mode: &StageMode,
+    embedding_mode: &EmbeddingMode,
+    pipeline_total: u128,
+) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str("  \"image\": {\n");
+    out.push_str(&format!("    \"path\": \"{}\",\n", json_escape(img_path)));
+    out.push_str(&format!("    \"width\": {},\n", img_w));
+    out.push_str(&format!("    \"height\": {},\n", img_h));
+    out.push_str(&format!("    \"type\": \"{}\"\n", img_type));
+    out.push_str("  },\n");
+    out.push_str("  \"detection\": {\n");
+    out.push_str("    \"model\": {\n");
+    out.push_str(&format!("      \"name\": \"{}\",\n", meta.model_name));
+    out.push_str(&format!("      \"onnx\": \"{}\",\n", meta.onnx_name));
+    out.push_str(&format!("      \"score_thr\": {:.2},\n", meta.score_thr));
+    out.push_str(&format!("      \"iou_thr\": {:.2}\n", meta.iou_thr));
+    out.push_str("    },\n");
+    out.push_str("    \"pre\": {\n");
+    out.push_str(&format!("      \"input\": \"{}x{}\",\n", meta.input_w, meta.input_h));
+    out.push_str(&format!("      \"color\": \"{}\",\n", meta.color));
+    out.push_str(&format!("      \"normalization\": \"{}\"\n", meta.normalization));
+    out.push_str("    },\n");
+    out.push_str("    \"post\": {\n");
+    out.push_str(&format!("      \"score\": \"{}\",\n", meta.score_formula));
+    out.push_str(&format!("      \"topk\": {{\"enabled\":{},\"value\":{}}},\n", meta.topk_enabled, meta.topk));
+    out.push_str(&format!(
+        "      \"nms\": {{\"type\":\"{}\",\"iou\":{:.2},\"sigma\":{:.2}}}\n",
+        meta.nms_type, meta.iou_thr, meta.soft_sigma
+    ));
+    out.push_str("    },\n");
+    out.push_str("    \"timing_ms\": {\n");
+    out.push_str(&format!("      \"pre\": {},\n", detect.pre_ms));
+    out.push_str(&format!("      \"pre_resize\": {},\n", detect.pre_resize_ms));
+    out.push_str(&format!("      \"pre_norm\": {},\n", detect.pre_norm_ms));
+    out.push_str(&format!("      \"infer\": {},\n", detect.infer_ms));
+    out.push_str(&format!("      \"post\": {},\n", detect.post_ms));
+    out.push_str(&format!("      \"total\": {}\n", detect.pre_ms + detect.infer_ms + detect.post_ms));
+    out.push_str("    },\n");
+    out.push_str("    \"faces\": [\n");
+    for (i, face) in faces.iter().enumerate() {
+        let sep = if i + 1 == faces.len() { "" } else { "," };
+        let mut line = String::new();
+        line.push_str("      {\"id\":");
+        line.push_str(&(i + 1).to_string());
+        line.push_str(&format!(
+            ",\"score\":{:.4},\"cls\":{:.4},\"obj\":{:.4},\"bbox\":[{:.2},{:.2},{:.2},{:.2}]",
+            face.score,
+            face.cls,
+            face.obj,
+            face.bbox[0],
+            face.bbox[1],
+            face.bbox[2],
+            face.bbox[3]
+        ));
+        if let Some(kps) = &face.kps {
+            line.push_str(",\"landmarks\":[");
+            for (j, kp) in kps.iter().enumerate() {
+                if j > 0 {
+                    line.push(',');
+                }
+                line.push_str(&format!("[{:.2},{:.2}]", kp[0], kp[1]));
+            }
+            line.push(']');
+        }
+        line.push('}');
+        line.push_str(sep);
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("    ]\n");
+    out.push_str("  },\n");
+    out.push_str("  \"embedding\": {\n");
+    if let Some((ms, len, count)) = embedding {
+        out.push_str("    \"enabled\": true,\n");
+        out.push_str("    \"input\": \"112x112\",\n");
+        out.push_str("    \"normalization\": \"(x - 127.5) / 128.0\",\n");
+        let encoding = match embedding_mode {
+            EmbeddingMode::Off => "off",
+            EmbeddingMode::Raw => "f32",
+            EmbeddingMode::QInt8 => "int8-hex",
+        };
+        out.push_str(&format!("    \"encoding\": \"{}\",\n", encoding));
+        out.push_str(&format!("    \"time_ms\": {},\n", ms));
+        out.push_str(&format!("    \"count\": {},\n", count));
+        out.push_str(&format!("    \"len\": {},\n", len));
+        if matches!(embedding_mode, EmbeddingMode::QInt8) {
+            out.push_str("    \"quant\": {\"zero_point\": 0, \"scale\": \"per-vector\"},\n");
+        }
+        out.push_str("    \"vectors\": [\n");
+        for (i, emb) in embeddings.iter().enumerate() {
+            let sep = if i + 1 == embeddings.len() { "" } else { "," };
+            let mut line = String::new();
+            line.push_str("      {\"id\": ");
+            line.push_str(&(i + 1).to_string());
+            if matches!(embedding_mode, EmbeddingMode::Raw) {
+                line.push_str(", \"values\": [");
+                for (j, v) in emb.iter().enumerate() {
+                    if j > 0 {
+                        line.push_str(", ");
+                    }
+                    line.push_str(&format!("{:.6}", v));
+                }
+                line.push_str("]}");
+            } else {
+                let mut max_abs = 0.0f32;
+                for v in emb {
+                    let a = v.abs();
+                    if a > max_abs {
+                        max_abs = a;
+                    }
+                }
+                let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+                line.push_str(", \"scale\": ");
+                line.push_str(&format!("{:.8}", scale));
+                line.push_str(", \"hex\": \"");
+                for v in emb {
+                    let mut q = (*v / scale).round();
+                    if q > 127.0 {
+                        q = 127.0;
+                    } else if q < -128.0 {
+                        q = -128.0;
+                    }
+                    let hex = (q as i8 as u8) as u8;
+                    line.push_str(&format!("{:02X}", hex));
+                }
+                line.push_str("\"}");
+            }
+            line.push_str(sep);
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.push_str("    ]\n");
+    } else {
+        out.push_str("    \"enabled\": false\n");
+    }
+    out.push_str("  },\n");
+    out.push_str("  \"pose\": {\n");
+    if let Some((det_ms, lm_ms, kp_len)) = pose {
+        out.push_str("    \"enabled\": true,\n");
+        out.push_str(&format!("    \"det\": {{\"input\":\"224x224\",\"normalization\":\"x/255.0\",\"time_ms\":{}}},\n", det_ms));
+        out.push_str(&format!("    \"landmarks\": {{\"input\":\"256x256\",\"normalization\":\"x/255.0\",\"time_ms\":{}}},\n", lm_ms));
+        out.push_str(&format!("    \"keypoints_len\": {}\n", kp_len));
+    } else {
+        out.push_str("    \"enabled\": false\n");
+    }
+    out.push_str("  },\n");
+    let stage_label = match stage_mode {
+        StageMode::Detection => "1",
+        StageMode::DetectionEmbedding => "11",
+        StageMode::EmbeddingOnly => "01",
+        StageMode::DetectionEmbeddingPose => "111",
+    };
+    out.push_str(&format!(
+        "  \"pipeline\": {{\"stages\": \"{}\", \"total_ms\": {}}}\n",
+        stage_label, pipeline_total
+    ));
+    out.push_str("}\n");
+    out
+}
+
 struct DetectResult {
     faces: Vec<FaceDet>,
     pre_ms: u128,
@@ -486,10 +763,14 @@ struct DetectResult {
     infer_ms: u128,
     post_ms: u128,
 }
-fn detect_faces_yunet(session: &mut Session, rgb: &RgbImage) -> Result<DetectResult> {
+fn detect_faces_yunet(
+    session: &mut Session,
+    rgb: &RgbImage,
+    score_thr: f32,
+) -> Result<DetectResult> {
     let t_pre = std::time::Instant::now();
-    let input_w = 640u32;
-    let input_h = 640u32;
+    let input_w = YUNET_INPUT_W;
+    let input_h = YUNET_INPUT_H;
     let t_resize = std::time::Instant::now();
     let resized = if rgb.width() == input_w && rgb.height() == input_h {
         rgb.clone()
@@ -525,10 +806,9 @@ fn detect_faces_yunet(session: &mut Session, rgb: &RgbImage) -> Result<DetectRes
     let strides = [8u32, 16u32, 32u32];
 
     let mut dets = Vec::new();
-    let score_thr = 0.02f32;
-    let iou_thr = 0.45f32;
-    let use_topk = true;
-    let topk_per_level = 200usize;
+    let iou_thr = YUNET_IOU_THR;
+    let use_topk = YUNET_TOPK_ENABLED;
+    let topk_per_level = YUNET_TOPK;
 
     for level in 0..strides.len() {
         let stride = strides[level];
@@ -653,10 +933,14 @@ fn detect_faces_yunet(session: &mut Session, rgb: &RgbImage) -> Result<DetectRes
     })
 }
 
-fn detect_faces_scrfd(session: &mut Session, rgb: &RgbImage) -> Result<DetectResult> {
+fn detect_faces_scrfd(
+    session: &mut Session,
+    rgb: &RgbImage,
+    score_thr: f32,
+) -> Result<DetectResult> {
     let t_pre = std::time::Instant::now();
-    let input_w = 640u32;
-    let input_h = 640u32;
+    let input_w = SCRFD_INPUT_W;
+    let input_h = SCRFD_INPUT_H;
     let t_resize = std::time::Instant::now();
     let (resized, det_scale) = resize_with_pad(rgb, input_w, input_h);
     let pre_resize_ms = t_resize.elapsed().as_millis();
@@ -695,10 +979,9 @@ fn detect_faces_scrfd(session: &mut Session, rgb: &RgbImage) -> Result<DetectRes
     };
 
     let mut dets = Vec::new();
-    let score_thr = 0.5f32;
-    let iou_thr = 0.45f32;
-    let soft_sigma = 0.5f32;
-    let use_soft_nms = true;
+    let iou_thr = SCRFD_IOU_THR;
+    let soft_sigma = SCRFD_SOFT_SIGMA;
+    let use_soft_nms = SCRFD_SOFT_NMS;
 
     for (level, stride) in strides.iter().enumerate() {
         let scores = extract_2d(&outputs[level])?;
@@ -962,11 +1245,57 @@ fn pose_landmarks(session: &mut Session, rgb: &RgbImage, _roi: [f32; 4]) -> Resu
 // ---------------------------------------------------------
 
 fn main() -> Result<()> {
-    let cli = parse_args();
+    let mut cli = parse_args();
+    let out_bundle = if cli.out_img_detections {
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let dir = std::env::current_dir()?.join(format!("picAnalizer-{run_id}"));
+        Some(OutBundle { run_id, dir })
+    } else {
+        None
+    };
 
-    println!("Cargando modelos...");
+    if cli.out_img_detections {
+        cli.text_mode_json = true;
+        cli.text_mode_silent = true;
+        cli.embedding_mode = EmbeddingMode::Raw;
+        cli.show_facial_landmarks = true;
+    }
+
+    let want_json = cli.text_mode_json || cli.out_img_detections || cli.text_mode_silent;
+    let result = run(cli, out_bundle.as_ref());
+    if let Err(err) = result {
+        let msg = err.to_string();
+        eprintln!("{msg}");
+        if want_json {
+            let err_json = format!(
+                "{{\"result\":1,\"msg\":\"{}\"}}\n",
+                json_escape(&msg)
+            );
+            if let Some(bundle) = out_bundle.as_ref() {
+                let _ = std::fs::create_dir_all(&bundle.dir);
+                let json_path = bundle.dir.join(format!("{}.json", bundle.run_id));
+                let _ = std::fs::write(json_path, &err_json);
+            }
+            println!("{err_json}");
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
+    let use_json = cli.text_mode_json;
+    let use_silent = cli.text_mode_silent;
+    if !use_json && !use_silent {
+        println!("Cargando modelos...");
+    }
     let mut models = Models::load(cli.face_model)?;
-    println!("Modelos cargados.");
+    if !use_json && !use_silent {
+        println!("Modelos cargados.");
+    }
 
     let img_path = cli.image_path.as_str();
     let img = image::open(img_path)?;
@@ -975,92 +1304,190 @@ fn main() -> Result<()> {
         .ok()
         .map(|f| format!("{f:?}"))
         .unwrap_or_else(|| "Unknown".to_string());
-    println!(
-        "Imagen: {} ({}x{}, tipo {})",
-        img_path,
-        rgb.width(),
-        rgb.height(),
-        img_type
-    );
-    print_face_model_details(&models.face_model);
+    if !use_json && !use_silent {
+        println!(
+            "Imagen: {} ({}x{}, tipo {})",
+            img_path,
+            rgb.width(),
+            rgb.height(),
+            img_type
+        );
+    }
+
+    if let Some(bundle) = out_bundle {
+        std::fs::create_dir_all(&bundle.dir)?;
+        let in_path = bundle.dir.join(format!("{}-in.jpg", bundle.run_id));
+        std::fs::copy(img_path, in_path)?;
+    }
+
+    let default_thr = match models.face_model {
+        FaceModel::YuNet => 0.10f32,
+        FaceModel::Scrfd => 0.50f32,
+    };
+    let score_thr = cli.score_thr.unwrap_or(default_thr);
+    let iou_thr = match models.face_model {
+        FaceModel::YuNet => YUNET_IOU_THR,
+        FaceModel::Scrfd => SCRFD_IOU_THR,
+    };
+    if !use_json && !use_silent {
+        print_face_model_details(&models.face_model, score_thr, iou_thr);
+    }
+    let detection_meta = match models.face_model {
+        FaceModel::YuNet => DetectionMeta {
+            model_name: "YuNet",
+            onnx_name: YUNET_ONNX,
+            input_w: YUNET_INPUT_W,
+            input_h: YUNET_INPUT_H,
+            color: "BGR",
+            normalization: "none",
+            score_formula: "cls*obj",
+            score_thr,
+            iou_thr,
+            topk_enabled: YUNET_TOPK_ENABLED,
+            topk: YUNET_TOPK,
+            nms_type: "nms",
+            soft_sigma: 0.0,
+        },
+        FaceModel::Scrfd => DetectionMeta {
+            model_name: "SCRFD",
+            onnx_name: SCRFD_ONNX,
+            input_w: SCRFD_INPUT_W,
+            input_h: SCRFD_INPUT_H,
+            color: "RGB",
+            normalization: "(x - 127.5) / 128.0",
+            score_formula: "score",
+            score_thr,
+            iou_thr,
+            topk_enabled: false,
+            topk: 0,
+            nms_type: if SCRFD_SOFT_NMS { "soft_nms" } else { "nms" },
+            soft_sigma: SCRFD_SOFT_SIGMA,
+        },
+    };
     let pipeline_start = std::time::Instant::now();
 
-    if cli.show_all {
+    if cli.show_all && !use_json && !use_silent {
         match models.face_model {
             FaceModel::YuNet => {
                 if let Some(ref m) = models.yunet {
-                    print_model_info("YuNet", "./models/yunet_n_640_640.onnx", m);
+                    print_model_info("YuNet", YUNET_ONNX, m);
                 }
             }
             FaceModel::Scrfd => {
                 if let Some(ref m) = models.scrfd {
-                    print_model_info("SCRFD", "./models/scrfd-det_2.5g.onnx", m);
+                    print_model_info("SCRFD", SCRFD_ONNX, m);
                 }
             }
         }
-        print_model_info("ArcFace", "./models/arcface.onnx", &models.arcface);
-        print_model_info("Pose detection", "./models/blazepose-pose_detection.onnx", &models.pose_det);
+        print_model_info("ArcFace", ARCFACE_ONNX, &models.arcface);
+        print_model_info("Pose detection", POSE_DET_ONNX, &models.pose_det);
         print_model_info(
             "Pose landmarks",
-            "./models/blazepose-pose_landmarks_detector_full.onnx",
+            POSE_LM_ONNX,
             &models.pose_landmarks,
         );
     }
 
     // 1) CARAS
-    let detect = match models.face_model {
-        FaceModel::YuNet => {
-            let s = models.yunet.as_mut().ok_or_else(|| anyhow::anyhow!("YuNet no cargado"))?;
-            detect_faces_yunet(s, &rgb)?
+    let detect = match cli.stage_mode {
+        StageMode::EmbeddingOnly => {
+            if rgb.width() != 112 || rgb.height() != 112 {
+                return Err(anyhow::anyhow!(
+                    "Embedding-only requiere imagen 112x112, got {}x{}",
+                    rgb.width(),
+                    rgb.height()
+                ));
+            }
+            DetectResult {
+                faces: vec![FaceDet {
+                    bbox: [0.0, 0.0, rgb.width() as f32, rgb.height() as f32],
+                    score: 1.0,
+                    cls: 1.0,
+                    obj: 1.0,
+                    kps: None,
+                }],
+                pre_ms: 0,
+                pre_resize_ms: 0,
+                pre_norm_ms: 0,
+                infer_ms: 0,
+                post_ms: 0,
+            }
         }
-        FaceModel::Scrfd => {
-            let s = models.scrfd.as_mut().ok_or_else(|| anyhow::anyhow!("SCRFD no cargado"))?;
-            detect_faces_scrfd(s, &rgb)?
-        }
+        _ => match models.face_model {
+            FaceModel::YuNet => {
+                let s = models.yunet.as_mut().ok_or_else(|| anyhow::anyhow!("YuNet no cargado"))?;
+                detect_faces_yunet(s, &rgb, score_thr)?
+            }
+            FaceModel::Scrfd => {
+                let s = models.scrfd.as_mut().ok_or_else(|| anyhow::anyhow!("SCRFD no cargado"))?;
+                detect_faces_scrfd(s, &rgb, score_thr)?
+            }
+        },
     };
     let faces = &detect.faces;
-    println!("Caras detectadas: {}", faces.len());
-    let iou_info = match models.face_model {
-        FaceModel::YuNet => 0.45f32,
-        FaceModel::Scrfd => 0.45f32,
-    };
-    for (i, face) in faces.iter().enumerate() {
-        println!(
-            "Cara #{}: {:.2}-{:.2}={:.2} iou={:.2}",
-            i + 1,
-            face.cls,
-            face.obj,
-            face.score,
-            iou_info
-        );
+    if !use_json && !use_silent {
+        println!("Caras detectadas: {}", faces.len());
+        for (i, face) in faces.iter().enumerate() {
+            println!(
+                "Cara #{}: {:.2}-{:.2}={:.2} iou={:.2}",
+                i + 1,
+                face.cls,
+                face.obj,
+                face.score,
+                iou_thr
+            );
+        }
+        let detect_total = detect.pre_ms + detect.infer_ms + detect.post_ms;
+        println!("Tiempo deteccion:");
+        println!("  pre:   {} ms", detect.pre_ms);
+        println!("         - resize: {} ms", detect.pre_resize_ms);
+        println!("         - norm:   {} ms", detect.pre_norm_ms);
+        println!("  infer: {} ms", detect.infer_ms);
+        println!("  post:  {} ms", detect.post_ms);
+        println!("  total: {} ms", detect_total);
     }
-    let detect_total = detect.pre_ms + detect.infer_ms + detect.post_ms;
-    println!("Tiempo deteccion:");
-    println!("  pre:   {} ms", detect.pre_ms);
-    println!("         - resize: {} ms", detect.pre_resize_ms);
-    println!("         - norm:   {} ms", detect.pre_norm_ms);
-    println!("  infer: {} ms", detect.infer_ms);
-    println!("  post:  {} ms", detect.post_ms);
-    println!("  total: {} ms", detect_total);
 
     let mut keypoints: Vec<[f32; 3]> = Vec::new();
     let mut roi_opt: Option<[f32; 4]> = None;
+    let mut embedding_info: Option<(u128, usize, usize)> = None;
+    let mut pose_info: Option<(u128, u128, usize)> = None;
 
-    if let Some(face) = faces.first() {
-        println!("EMBEDDING / ArcFace");
-        println!("  PRE:");
-        println!("    - Input: 112x112");
-        println!("    - Normalizacion: (x - 127.5) / 128.0");
-        let t_embed = std::time::Instant::now();
-        let crop = crop_face(&rgb, &face.bbox);
-        let emb = face_embedding(&mut models.arcface, &crop)?;
-        println!("  Tiempo embedding: {} ms", t_embed.elapsed().as_millis());
-        println!("  Embedding facial: {}", emb.len());
+    let mut embeddings: Vec<Vec<f32>> = Vec::new();
+    if matches!(cli.stage_mode, StageMode::DetectionEmbedding | StageMode::DetectionEmbeddingPose | StageMode::EmbeddingOnly)
+        && !matches!(cli.embedding_mode, EmbeddingMode::Off)
+    {
+        if !faces.is_empty() {
+            if !use_json && !use_silent {
+                println!("EMBEDDING / ArcFace");
+                println!("  PRE:");
+                println!("    - Input: 112x112");
+                println!("    - Normalizacion: (x - 127.5) / 128.0");
+            }
+            let t_embed = std::time::Instant::now();
+            for face in faces {
+                let crop = crop_face(&rgb, &face.bbox);
+                let emb = face_embedding(&mut models.arcface, &crop)?;
+                embeddings.push(emb);
+            }
+            let embed_ms = t_embed.elapsed().as_millis();
+            let emb_len = embeddings.first().map(|e| e.len()).unwrap_or(0);
+            embedding_info = Some((embed_ms, emb_len, embeddings.len()));
+            if !use_json && !use_silent {
+                println!("  Tiempo embedding: {} ms", embed_ms);
+                println!("  Embeddings faciales: {} (len={})", embeddings.len(), emb_len);
+                for (i, emb) in embeddings.iter().enumerate() {
+                    println!("    - Cara #{}: {}", i + 1, emb.len());
+                }
+            }
+        }
+    }
 
-        // 2) POSE
-        println!("POSE");
-        println!("  PRE:");
-        println!("    - Pose det input: 224x224, norm x/255.0");
+    if matches!(cli.stage_mode, StageMode::DetectionEmbeddingPose) {
+        if !use_json && !use_silent {
+            println!("POSE");
+            println!("  PRE:");
+            println!("    - Pose det input: 224x224, norm x/255.0");
+        }
         let t_pose_det = std::time::Instant::now();
         let roi = pose_detection(&mut models.pose_det, &rgb)?;
         let roi_scale_x = rgb.width() as f32 / 224.0;
@@ -1071,15 +1498,20 @@ fn main() -> Result<()> {
             roi[2] * roi_scale_x,
             roi[3] * roi_scale_y,
         ]);
-        println!(
-            "    - Rescaling ROI: scale_x={:.4}, scale_y={:.4}",
-            roi_scale_x, roi_scale_y
-        );
-        println!("  POST:");
-        println!("    - ROI pose: {:?}", roi);
-        println!("    - Tiempo pose_det: {} ms", t_pose_det.elapsed().as_millis());
+        let pose_det_ms = t_pose_det.elapsed().as_millis();
+        if !use_json && !use_silent {
+            println!(
+                "    - Rescaling ROI: scale_x={:.4}, scale_y={:.4}",
+                roi_scale_x, roi_scale_y
+            );
+            println!("  POST:");
+            println!("    - ROI pose: {:?}", roi);
+            println!("    - Tiempo pose_det: {} ms", pose_det_ms);
+        }
 
-        println!("    - Pose landmarks input: 256x256, norm x/255.0");
+        if !use_json && !use_silent {
+            println!("    - Pose landmarks input: 256x256, norm x/255.0");
+        }
         let t_pose_lm = std::time::Instant::now();
         keypoints = pose_landmarks(&mut models.pose_landmarks, &rgb, roi)?;
         let kp_scale_x = rgb.width() as f32 / 256.0;
@@ -1088,23 +1520,98 @@ fn main() -> Result<()> {
             kp[0] *= kp_scale_x;
             kp[1] *= kp_scale_y;
         }
-        println!(
-            "    - Rescaling keypoints: scale_x={:.4}, scale_y={:.4}",
-            kp_scale_x, kp_scale_y
-        );
-        println!("    - Tiempo pose_landmarks: {} ms", t_pose_lm.elapsed().as_millis());
-        println!("    - Keypoints: {}", keypoints.len());
+        let pose_lm_ms = t_pose_lm.elapsed().as_millis();
+        pose_info = Some((pose_det_ms, pose_lm_ms, keypoints.len()));
+        if !use_json && !use_silent {
+            println!(
+                "    - Rescaling keypoints: scale_x={:.4}, scale_y={:.4}",
+                kp_scale_x, kp_scale_y
+            );
+            println!("    - Tiempo pose_landmarks: {} ms", pose_lm_ms);
+            println!("    - Keypoints: {}", keypoints.len());
+        }
+    }
 
-        let sim = cosine(&emb, &emb);
-        println!("Similitud facial consigo mismo: {}", sim);
+    if !use_json && !use_silent {
+        if let Some(first) = embeddings.first() {
+            let sim = cosine(first, first);
+            println!("Similitud facial consigo mismo: {}", sim);
+        }
     }
 
     let pipeline_total = pipeline_start.elapsed().as_millis();
-    println!("Tiempo pipeline total: {} ms", pipeline_total);
+    if !use_json && !use_silent {
+        println!("Tiempo pipeline total: {} ms", pipeline_total);
+    }
+
+    let json_out = if use_json || out_bundle.is_some() {
+        Some(build_json_output(
+            &detection_meta,
+            img_path,
+            rgb.width(),
+            rgb.height(),
+            &img_type,
+            &detect,
+            faces,
+            embedding_info,
+            &embeddings,
+            pose_info,
+            &cli.stage_mode,
+            &cli.embedding_mode,
+            pipeline_total,
+        ))
+    } else {
+        None
+    };
+    if let Some(ref json) = json_out {
+        if use_json && !use_silent {
+            print!("{json}");
+        }
+        if let Some(bundle) = out_bundle {
+            let json_path = bundle.dir.join(format!("{}.json", bundle.run_id));
+            std::fs::write(json_path, json)?;
+        }
+    }
+
+    if let Some(out_arg) = cli.out_file.as_deref() {
+        let out_path = if out_arg.trim().is_empty() {
+            let path = Path::new(img_path);
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image");
+            let out_name = format!("{stem}out.jpg");
+            match path.parent() {
+                Some(parent) => parent.join(out_name),
+                None => Path::new(&out_name).to_path_buf(),
+            }
+        } else {
+            Path::new(out_arg).to_path_buf()
+        };
+        let annotated = annotate_image(&rgb, faces, &keypoints, cli.show_facial_landmarks, iou_thr);
+        annotated.save(&out_path)?;
+        if !use_json && !use_silent {
+            println!("Imagen guardada: {}", out_path.display());
+        }
+    }
+
+    if let Some(bundle) = out_bundle {
+        let out_path = bundle.dir.join(format!("{}-out.jpg", bundle.run_id));
+        let annotated = annotate_image(&rgb, faces, &keypoints, cli.show_facial_landmarks, iou_thr);
+        annotated.save(&out_path)?;
+        if matches!(cli.stage_mode, StageMode::DetectionEmbedding | StageMode::DetectionEmbeddingPose | StageMode::EmbeddingOnly) {
+            for (i, face) in faces.iter().enumerate() {
+                let crop = crop_face(&rgb, &face.bbox);
+                let crop_path = bundle.dir.join(format!("{}-{}.jpg", bundle.run_id, i + 1));
+                crop.save(crop_path)?;
+            }
+        }
+    }
 
     if cli.show_ui {
         let title = format!(
-            "YuNet - {}x{} - {}",
+            "{} - {}x{} - {}",
+            detection_meta.model_name,
             rgb.width(),
             rgb.height(),
             img_type
@@ -1116,7 +1623,7 @@ fn main() -> Result<()> {
             roi_opt,
             &title,
             cli.show_facial_landmarks,
-            iou_info,
+            iou_thr,
         )?;
     }
 

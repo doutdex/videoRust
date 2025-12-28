@@ -53,6 +53,9 @@ Parametros CLI
   - `unixtime.json` (analisis)
   - `unixtime-1.jpg`, `unixtime-2.jpg`, ... (crops para embedding)
   - fuerza: `textmode=json`, `textmode=0`, `embed=2`, `showLandmarks`
+- `device=cpu|gpu` -> selecciona CPU o GPU (fallback a CPU si no hay EP).
+- `resize=fast|balanced|quality` -> controla calidad/velocidad del resize (default: balanced).
+  - fuerza: `textmode=json`, `textmode=0`, `embed=2`, `showLandmarks`
 
 Embedding (JSON)
 - En `textmode=json`, los embeddings salen  quantizado como `qint8` en hex concatenado (default) o `raw` con `embed=2`.

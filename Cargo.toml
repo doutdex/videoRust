@@ -20,4 +20,5 @@ anyhow = "1"
 image = "0.25"
 minifb = "0.27"
 ndarray = "0.16.1"
+fast_image_resize = "2"
 ort = { version = "2.0.0-rc.10", features = ["ndarray"] }

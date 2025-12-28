@@ -1,11 +1,15 @@
 use anyhow::Result;
+use fast_image_resize::{FilterType as FirFilterType, ResizeAlg};
 use image::RgbImage;
 use minifb::{Key, Window, WindowOptions};
 use ndarray::{Array2, Array4, Axis, Ix1, Ix2};
+use ort::execution_providers::{CPUExecutionProvider, DirectMLExecutionProvider};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
 
+mod lib_fast_resize;
+use lib_fast_resize::ResizeWorkspace;
 // ---------------------------------------------------------
 // MODELOS
 // ---------------------------------------------------------
@@ -43,26 +47,26 @@ struct Models {
 }
 
 impl Models {
-    fn load(face_model: FaceModel) -> Result<Self> {
+    fn load(face_model: FaceModel, device_mode: DeviceMode) -> Result<Self> {
         let _ = ort::init().with_name("vision-core").commit()?;
 
         let (yunet, scrfd) = match face_model {
             FaceModel::YuNet => {
-                let s = Session::builder()?.commit_from_file(YUNET_ONNX)?;
+                let s = build_session(YUNET_ONNX, &device_mode)?;
                 (Some(s), None)
             }
             FaceModel::Scrfd => {
-                let s = Session::builder()?.commit_from_file(SCRFD_ONNX)?;
+                let s = build_session(SCRFD_ONNX, &device_mode)?;
 
                 (None, Some(s))
             }
         };
 
-        let arcface = Session::builder()?.commit_from_file(ARCFACE_ONNX)?;
+        let arcface = build_session(ARCFACE_ONNX, &device_mode)?;
 
-        let pose_det = Session::builder()?.commit_from_file(POSE_DET_ONNX)?;
+        let pose_det = build_session(POSE_DET_ONNX, &device_mode)?;
 
-        let pose_landmarks = Session::builder()?.commit_from_file(POSE_LM_ONNX)?;
+        let pose_landmarks = build_session(POSE_LM_ONNX, &device_mode)?;
 
         Ok(Self {
             face_model,
@@ -72,6 +76,31 @@ impl Models {
             pose_det,
             pose_landmarks,
         })
+    }
+}
+
+fn build_session(path: &str, device_mode: &DeviceMode) -> Result<Session> {
+    match device_mode {
+        DeviceMode::Gpu => {
+            let ep = DirectMLExecutionProvider::default().build();
+            let builder = Session::builder()?
+                .with_execution_providers([ep])?;
+            match builder.commit_from_file(path) {
+                Ok(session) => Ok(session),
+                Err(_) => {
+                    let cpu = CPUExecutionProvider::default().build();
+                    Ok(Session::builder()?
+                        .with_execution_providers([cpu])?
+                        .commit_from_file(path)?)
+                }
+            }
+        }
+        DeviceMode::Cpu => {
+            let cpu = CPUExecutionProvider::default().build();
+            Ok(Session::builder()?
+                .with_execution_providers([cpu])?
+                .commit_from_file(path)?)
+        }
     }
 }
 
@@ -211,33 +240,6 @@ fn draw_point(img: &mut RgbImage, x: f32, y: f32, color: [u8; 3]) {
             }
         }
     }
-}
-
-fn resize_with_pad(img: &RgbImage, target_w: u32, target_h: u32) -> (RgbImage, f32) {
-    let img_w = img.width();
-    let img_h = img.height();
-    if img_w == target_w && img_h == target_h {
-        return (img.clone(), 1.0);
-    }
-    let im_ratio = img_h as f32 / img_w as f32;
-    let model_ratio = target_h as f32 / target_w as f32;
-
-    let (new_w, new_h) = if im_ratio > model_ratio {
-        let new_h = target_h;
-        let new_w = (new_h as f32 / im_ratio).round().max(1.0) as u32;
-        (new_w, new_h)
-    } else {
-        let new_w = target_w;
-        let new_h = (new_w as f32 * im_ratio).round().max(1.0) as u32;
-        (new_w, new_h)
-    };
-
-    let det_scale = new_h as f32 / img_h as f32;
-    let resized = image::imageops::resize(img, new_w, new_h, image::imageops::Triangle);
-    let mut det_img = RgbImage::new(target_w, target_h);
-    image::imageops::replace(&mut det_img, &resized, 0, 0);
-
-    (det_img, det_scale)
 }
 
 fn draw_char(img: &mut RgbImage, x: i32, y: i32, ch: char, scale: i32, color: [u8; 3]) {
@@ -424,12 +426,25 @@ struct CliArgs {
     out_file: Option<String>,
     embedding_mode: EmbeddingMode,
     out_img_detections: bool,
+    device_mode: DeviceMode,
+    resize_mode: ResizeMode,
 }
 
 enum EmbeddingMode {
     Off,
     Raw,
     QInt8,
+}
+
+enum DeviceMode {
+    Cpu,
+    Gpu,
+}
+
+enum ResizeMode {
+    Fast,
+    Balanced,
+    Quality,
 }
 
 enum StageMode {
@@ -444,12 +459,43 @@ struct OutBundle {
     dir: std::path::PathBuf,
 }
 
+struct PreprocessBuffers {
+    yunet: Array4<f32>,
+    scrfd: Array4<f32>,
+    arcface: Array4<f32>,
+    pose_det: Array4<f32>,
+    pose_landmarks: Array4<f32>,
+    resize: ResizeWorkspace,
+    buf_640: Vec<u8>,
+    buf_640_tmp: Vec<u8>,
+    buf_112: Vec<u8>,
+    buf_224: Vec<u8>,
+    buf_256: Vec<u8>,
+}
+
+impl PreprocessBuffers {
+    fn new(resize_alg: ResizeAlg) -> Self {
+        Self {
+            yunet: Array4::<f32>::zeros((1, 3, YUNET_INPUT_H as usize, YUNET_INPUT_W as usize)),
+            scrfd: Array4::<f32>::zeros((1, 3, SCRFD_INPUT_H as usize, SCRFD_INPUT_W as usize)),
+            arcface: Array4::<f32>::zeros((1, 112, 112, 3)),
+            pose_det: Array4::<f32>::zeros((1, 224, 224, 3)),
+            pose_landmarks: Array4::<f32>::zeros((1, 256, 256, 3)),
+            resize: ResizeWorkspace::new(resize_alg),
+            buf_640: vec![0; (YUNET_INPUT_W * YUNET_INPUT_H * 3) as usize],
+            buf_640_tmp: vec![0; (YUNET_INPUT_W * YUNET_INPUT_H * 3) as usize],
+            buf_112: vec![0; (112 * 112 * 3) as usize],
+            buf_224: vec![0; (224 * 224 * 3) as usize],
+            buf_256: vec![0; (256 * 256 * 3) as usize],
+        }
+    }
+}
 fn parse_args() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let help = args.iter().any(|a| a == "-h" || a == "--help");
     if help {
         println!("Uso:");
-        println!("  picAnalizer [uiShow] [showLandmarks] [showAll] [facemodel=1|2] [infile=path] [threshold=val] [textmode=json|0] [stages=1|11|01|111] [outfile=path|0] [embed=0|1|2]");
+        println!("  picAnalizer [uiShow] [showLandmarks] [showAll] [facemodel=1|2] [infile=path] [threshold=val] [textmode=json|0] [stages=1|11|01|111] [outfile=path|0] [embed=0|1|2] [device=cpu|gpu]");
         println!();
         println!("Parametros:");
         println!("  uiShow                 Abre ventana con detecciones");
@@ -464,6 +510,8 @@ fn parse_args() -> CliArgs {
         println!("  outfile=path|0         Guarda imagen anotada (0 = no genera archivo)");
         println!("  embed=0|1|2             Embedding en JSON: 0=off, 1=qint8 (default), 2=raw");
         println!("  outDirDetections=1     Genera carpeta con in/out/json y crops de embedding");
+        println!("  device=cpu|gpu         Selecciona CPU o GPU (fallback a CPU si no hay EP)");
+        println!("  resize=fast|balanced|quality  Controla calidad/velocidad de resize (default: balanced)");
         std::process::exit(0);
     }
 
@@ -521,6 +569,22 @@ fn parse_args() -> CliArgs {
             }
         });
     let out_img_detections = args.iter().any(|a| a == "outDirDetections=1" || a == "--outDirDetections=1");
+    let device_mode = args
+        .iter()
+        .find_map(|a| a.strip_prefix("device=").or_else(|| a.strip_prefix("--device=")))
+        .map(|v| v.to_ascii_lowercase())
+        .map(|v| if v == "gpu" { DeviceMode::Gpu } else { DeviceMode::Cpu })
+        .unwrap_or(DeviceMode::Cpu);
+    let resize_mode = args
+        .iter()
+        .find_map(|a| a.strip_prefix("resize=").or_else(|| a.strip_prefix("--resize=")))
+        .map(|v| v.to_ascii_lowercase())
+        .map(|v| match v.as_str() {
+            "fast" => ResizeMode::Fast,
+            "quality" => ResizeMode::Quality,
+            _ => ResizeMode::Balanced,
+        })
+        .unwrap_or(ResizeMode::Balanced);
     let embedding_mode = args
         .iter()
         .find_map(|a| a.strip_prefix("embed=").or_else(|| a.strip_prefix("--embed=")))
@@ -545,6 +609,8 @@ fn parse_args() -> CliArgs {
         out_file,
         embedding_mode,
         out_img_detections,
+        device_mode,
+        resize_mode,
     }
 }
 
@@ -747,9 +813,11 @@ fn build_json_output(
         StageMode::EmbeddingOnly => "01",
         StageMode::DetectionEmbeddingPose => "111",
     };
+    let detect_total = detect.pre_ms + detect.infer_ms + detect.post_ms;
+    let gap_ms = pipeline_total.saturating_sub(detect_total);
     out.push_str(&format!(
-        "  \"pipeline\": {{\"stages\": \"{}\", \"total_ms\": {}}}\n",
-        stage_label, pipeline_total
+        "  \"pipeline\": {{\"stages\": \"{}\", \"total_ms\": {}, \"gap_ms\": {}}}\n",
+        stage_label, pipeline_total, gap_ms
     ));
     out.push_str("}\n");
     out
@@ -767,31 +835,39 @@ fn detect_faces_yunet(
     session: &mut Session,
     rgb: &RgbImage,
     score_thr: f32,
+    buffers: &mut PreprocessBuffers,
 ) -> Result<DetectResult> {
     let t_pre = std::time::Instant::now();
     let input_w = YUNET_INPUT_W;
     let input_h = YUNET_INPUT_H;
     let t_resize = std::time::Instant::now();
-    let resized = if rgb.width() == input_w && rgb.height() == input_h {
-        rgb.clone()
+    let needs_resize = rgb.width() != input_w || rgb.height() != input_h;
+    let (resize, buf_640, input_buf) = (&mut buffers.resize, &mut buffers.buf_640, &mut buffers.yunet);
+    let raw = if needs_resize {
+        resize.resize_rgb_into(rgb, input_w, input_h, buf_640)?;
+        buf_640.as_slice()
     } else {
-        image::imageops::resize(rgb, input_w, input_h, image::imageops::Triangle)
+        rgb.as_raw().as_slice()
     };
-    let pre_resize_ms = t_resize.elapsed().as_millis();
+    let pre_resize_ms = if needs_resize { t_resize.elapsed().as_millis() } else { 0 };
 
     let t_norm = std::time::Instant::now();
-    let mut input = Array4::<f32>::zeros((1, 3, input_h as usize, input_w as usize));
-    for y in 0..input_h {
-        for x in 0..input_w {
-            let p = resized.get_pixel(x as u32, y as u32);
+    let w = input_w as usize;
+    for y in 0..input_h as usize {
+        let row = y * w * 3;
+        for x in 0..w {
+            let idx = row + x * 3;
+            let r = raw[idx] as f32;
+            let g = raw[idx + 1] as f32;
+            let b = raw[idx + 2] as f32;
             // YuNet se entreno con BGR, no RGB.
-            input[[0, 0, y as usize, x as usize]] = p[2] as f32;
-            input[[0, 1, y as usize, x as usize]] = p[1] as f32;
-            input[[0, 2, y as usize, x as usize]] = p[0] as f32;
+            input_buf[[0, 0, y, x]] = b;
+            input_buf[[0, 1, y, x]] = g;
+            input_buf[[0, 2, y, x]] = r;
         }
     }
 
-    let input = Tensor::from_array(input)?;
+    let input = Tensor::from_array(input_buf.clone())?;
     let pre_norm_ms = t_norm.elapsed().as_millis();
     let pre_ms = t_pre.elapsed().as_millis();
 
@@ -937,26 +1013,43 @@ fn detect_faces_scrfd(
     session: &mut Session,
     rgb: &RgbImage,
     score_thr: f32,
+    buffers: &mut PreprocessBuffers,
 ) -> Result<DetectResult> {
     let t_pre = std::time::Instant::now();
     let input_w = SCRFD_INPUT_W;
     let input_h = SCRFD_INPUT_H;
     let t_resize = std::time::Instant::now();
-    let (resized, det_scale) = resize_with_pad(rgb, input_w, input_h);
-    let pre_resize_ms = t_resize.elapsed().as_millis();
+    let needs_resize = rgb.width() != input_w || rgb.height() != input_h;
+    let (resize, buf_640, buf_640_tmp, input_buf) = (
+        &mut buffers.resize,
+        &mut buffers.buf_640,
+        &mut buffers.buf_640_tmp,
+        &mut buffers.scrfd,
+    );
+    let (raw, det_scale) = if needs_resize {
+        let scale = resize.resize_with_pad_into(rgb, input_w, input_h, buf_640_tmp, buf_640)?;
+        (buf_640.as_slice(), scale)
+    } else {
+        (rgb.as_raw().as_slice(), 1.0f32)
+    };
+    let pre_resize_ms = if needs_resize { t_resize.elapsed().as_millis() } else { 0 };
 
     let t_norm = std::time::Instant::now();
-    let mut input = Array4::<f32>::zeros((1, 3, input_h as usize, input_w as usize));
-    for y in 0..input_h {
-        for x in 0..input_w {
-            let p = resized.get_pixel(x as u32, y as u32);
-            input[[0, 0, y as usize, x as usize]] = (p[0] as f32 - 127.5) / 128.0;
-            input[[0, 1, y as usize, x as usize]] = (p[1] as f32 - 127.5) / 128.0;
-            input[[0, 2, y as usize, x as usize]] = (p[2] as f32 - 127.5) / 128.0;
+    let w = input_w as usize;
+    for y in 0..input_h as usize {
+        let row = y * w * 3;
+        for x in 0..w {
+            let idx = row + x * 3;
+            let r = raw[idx] as f32;
+            let g = raw[idx + 1] as f32;
+            let b = raw[idx + 2] as f32;
+            input_buf[[0, 0, y, x]] = (r - 127.5) / 128.0;
+            input_buf[[0, 1, y, x]] = (g - 127.5) / 128.0;
+            input_buf[[0, 2, y, x]] = (b - 127.5) / 128.0;
         }
     }
 
-    let input = Tensor::from_array(input)?;
+    let input = Tensor::from_array(input_buf.clone())?;
     let pre_norm_ms = t_norm.elapsed().as_millis();
     let pre_ms = t_pre.elapsed().as_millis();
 
@@ -1073,8 +1166,8 @@ fn detect_faces_scrfd(
     } else {
         nms(dets, iou_thr)
     };
-    let scale_x = 1.0 / det_scale;
-    let scale_y = 1.0 / det_scale;
+    let scale_x = 1.0f32 / det_scale;
+    let scale_y = 1.0f32 / det_scale;
 
     let mut faces = Vec::new();
     for det in dets {
@@ -1114,20 +1207,33 @@ fn detect_faces_scrfd(
 // ARCFACE — EMBEDDING FACIAL
 // ---------------------------------------------------------
 
-fn face_embedding(session: &mut Session, face: &RgbImage) -> Result<Vec<f32>> {
-    let resized = image::imageops::resize(face, 112, 112, image::imageops::Lanczos3);
-
-    let mut input = Array4::<f32>::zeros((1, 112, 112, 3));
-    for y in 0..112 {
-        for x in 0..112 {
-            let p = resized.get_pixel(x as u32, y as u32);
-            input[[0, y, x, 0]] = (p[0] as f32 - 127.5) / 128.0;
-            input[[0, y, x, 1]] = (p[1] as f32 - 127.5) / 128.0;
-            input[[0, y, x, 2]] = (p[2] as f32 - 127.5) / 128.0;
+fn face_embedding(
+    session: &mut Session,
+    face: &RgbImage,
+    buffers: &mut PreprocessBuffers,
+) -> Result<Vec<f32>> {
+    let needs_resize = face.width() != 112 || face.height() != 112;
+    let (resize, buf_112, input_buf) = (&mut buffers.resize, &mut buffers.buf_112, &mut buffers.arcface);
+    let raw = if needs_resize {
+        resize.resize_rgb_into(face, 112, 112, buf_112)?;
+        buf_112.as_slice()
+    } else {
+        face.as_raw().as_slice()
+    };
+    for y in 0..112usize {
+        let row = y * 112 * 3;
+        for x in 0..112usize {
+            let idx = row + x * 3;
+            let r = raw[idx] as f32;
+            let g = raw[idx + 1] as f32;
+            let b = raw[idx + 2] as f32;
+            input_buf[[0, y, x, 0]] = (r - 127.5) / 128.0;
+            input_buf[[0, y, x, 1]] = (g - 127.5) / 128.0;
+            input_buf[[0, y, x, 2]] = (b - 127.5) / 128.0;
         }
     }
 
-    let input = Tensor::from_array(input)?;
+    let input = Tensor::from_array(input_buf.clone())?;
     let outputs = session.run(ort::inputs![input])?;
 
     let emb = outputs[0].try_extract_array::<f32>()?;
@@ -1148,20 +1254,30 @@ fn face_embedding(session: &mut Session, face: &RgbImage) -> Result<Vec<f32>> {
 // BLAZEPOSE — DETECCIÓN + LANDMARKS
 // ---------------------------------------------------------
 
-fn pose_detection(session: &mut Session, rgb: &RgbImage) -> Result<[f32; 4]> {
-    let resized = image::imageops::resize(rgb, 224, 224, image::imageops::Triangle);
-
-    let mut input = Array4::<f32>::zeros((1, 224, 224, 3));
-    for y in 0..224 {
-        for x in 0..224 {
-            let p = resized.get_pixel(x as u32, y as u32);
-            input[[0, y, x, 0]] = p[0] as f32 / 255.0;
-            input[[0, y, x, 1]] = p[1] as f32 / 255.0;
-            input[[0, y, x, 2]] = p[2] as f32 / 255.0;
+fn pose_detection(
+    session: &mut Session,
+    rgb: &RgbImage,
+    buffers: &mut PreprocessBuffers,
+) -> Result<[f32; 4]> {
+    let needs_resize = rgb.width() != 224 || rgb.height() != 224;
+    let (resize, buf_224, input_buf) = (&mut buffers.resize, &mut buffers.buf_224, &mut buffers.pose_det);
+    let raw = if needs_resize {
+        resize.resize_rgb_into(rgb, 224, 224, buf_224)?;
+        buf_224.as_slice()
+    } else {
+        rgb.as_raw().as_slice()
+    };
+    for y in 0..224usize {
+        let row = y * 224 * 3;
+        for x in 0..224usize {
+            let idx = row + x * 3;
+            input_buf[[0, y, x, 0]] = raw[idx] as f32 / 255.0;
+            input_buf[[0, y, x, 1]] = raw[idx + 1] as f32 / 255.0;
+            input_buf[[0, y, x, 2]] = raw[idx + 2] as f32 / 255.0;
         }
     }
 
-    let input = Tensor::from_array(input)?;
+    let input = Tensor::from_array(input_buf.clone())?;
     let outputs = session.run(ort::inputs![input])?;
 
     let det = outputs[0].try_extract_array::<f32>()?;
@@ -1199,20 +1315,32 @@ fn pose_detection(session: &mut Session, rgb: &RgbImage) -> Result<[f32; 4]> {
     Ok([row[0], row[1], row[2], row[3]])
 }
 
-fn pose_landmarks(session: &mut Session, rgb: &RgbImage, _roi: [f32; 4]) -> Result<Vec<[f32; 3]>> {
-    let resized = image::imageops::resize(rgb, 256, 256, image::imageops::Triangle);
-
-    let mut input = Array4::<f32>::zeros((1, 256, 256, 3));
-    for y in 0..256 {
-        for x in 0..256 {
-            let p = resized.get_pixel(x as u32, y as u32);
-            input[[0, y, x, 0]] = p[0] as f32 / 255.0;
-            input[[0, y, x, 1]] = p[1] as f32 / 255.0;
-            input[[0, y, x, 2]] = p[2] as f32 / 255.0;
+fn pose_landmarks(
+    session: &mut Session,
+    rgb: &RgbImage,
+    _roi: [f32; 4],
+    buffers: &mut PreprocessBuffers,
+) -> Result<Vec<[f32; 3]>> {
+    let needs_resize = rgb.width() != 256 || rgb.height() != 256;
+    let (resize, buf_256, input_buf) =
+        (&mut buffers.resize, &mut buffers.buf_256, &mut buffers.pose_landmarks);
+    let raw = if needs_resize {
+        resize.resize_rgb_into(rgb, 256, 256, buf_256)?;
+        buf_256.as_slice()
+    } else {
+        rgb.as_raw().as_slice()
+    };
+    for y in 0..256usize {
+        let row = y * 256 * 3;
+        for x in 0..256usize {
+            let idx = row + x * 3;
+            input_buf[[0, y, x, 0]] = raw[idx] as f32 / 255.0;
+            input_buf[[0, y, x, 1]] = raw[idx + 1] as f32 / 255.0;
+            input_buf[[0, y, x, 2]] = raw[idx + 2] as f32 / 255.0;
         }
     }
 
-    let input = Tensor::from_array(input)?;
+    let input = Tensor::from_array(input_buf.clone())?;
     let outputs = session.run(ort::inputs![input])?;
 
     let kp = outputs[0].try_extract_array::<f32>()?;
@@ -1289,10 +1417,15 @@ fn main() -> Result<()> {
 fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
     let use_json = cli.text_mode_json;
     let use_silent = cli.text_mode_silent;
+    let resize_alg = match cli.resize_mode {
+        ResizeMode::Fast => ResizeAlg::Nearest,
+        ResizeMode::Quality => ResizeAlg::Convolution(FirFilterType::CatmullRom),
+        ResizeMode::Balanced => ResizeAlg::Convolution(FirFilterType::Bilinear),
+    };
     if !use_json && !use_silent {
         println!("Cargando modelos...");
     }
-    let mut models = Models::load(cli.face_model)?;
+    let mut models = Models::load(cli.face_model, cli.device_mode)?;
     if !use_json && !use_silent {
         println!("Modelos cargados.");
     }
@@ -1364,6 +1497,7 @@ fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
             soft_sigma: SCRFD_SOFT_SIGMA,
         },
     };
+    let mut buffers = PreprocessBuffers::new(resize_alg);
     let pipeline_start = std::time::Instant::now();
 
     if cli.show_all && !use_json && !use_silent {
@@ -1416,11 +1550,11 @@ fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
         _ => match models.face_model {
             FaceModel::YuNet => {
                 let s = models.yunet.as_mut().ok_or_else(|| anyhow::anyhow!("YuNet no cargado"))?;
-                detect_faces_yunet(s, &rgb, score_thr)?
+                detect_faces_yunet(s, &rgb, score_thr, &mut buffers)?
             }
             FaceModel::Scrfd => {
                 let s = models.scrfd.as_mut().ok_or_else(|| anyhow::anyhow!("SCRFD no cargado"))?;
-                detect_faces_scrfd(s, &rgb, score_thr)?
+                detect_faces_scrfd(s, &rgb, score_thr, &mut buffers)?
             }
         },
     };
@@ -1466,7 +1600,7 @@ fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
             let t_embed = std::time::Instant::now();
             for face in faces {
                 let crop = crop_face(&rgb, &face.bbox);
-                let emb = face_embedding(&mut models.arcface, &crop)?;
+                let emb = face_embedding(&mut models.arcface, &crop, &mut buffers)?;
                 embeddings.push(emb);
             }
             let embed_ms = t_embed.elapsed().as_millis();
@@ -1489,7 +1623,7 @@ fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
             println!("    - Pose det input: 224x224, norm x/255.0");
         }
         let t_pose_det = std::time::Instant::now();
-        let roi = pose_detection(&mut models.pose_det, &rgb)?;
+        let roi = pose_detection(&mut models.pose_det, &rgb, &mut buffers)?;
         let roi_scale_x = rgb.width() as f32 / 224.0;
         let roi_scale_y = rgb.height() as f32 / 224.0;
         roi_opt = Some([
@@ -1513,7 +1647,7 @@ fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
             println!("    - Pose landmarks input: 256x256, norm x/255.0");
         }
         let t_pose_lm = std::time::Instant::now();
-        keypoints = pose_landmarks(&mut models.pose_landmarks, &rgb, roi)?;
+        keypoints = pose_landmarks(&mut models.pose_landmarks, &rgb, roi, &mut buffers)?;
         let kp_scale_x = rgb.width() as f32 / 256.0;
         let kp_scale_y = rgb.height() as f32 / 256.0;
         for kp in &mut keypoints {
@@ -1542,6 +1676,9 @@ fn run(cli: CliArgs, out_bundle: Option<&OutBundle>) -> Result<()> {
     let pipeline_total = pipeline_start.elapsed().as_millis();
     if !use_json && !use_silent {
         println!("Tiempo pipeline total: {} ms", pipeline_total);
+        let detect_total = detect.pre_ms + detect.infer_ms + detect.post_ms;
+        let gap_ms = pipeline_total.saturating_sub(detect_total);
+        println!("Tiempo gap total (fuera deteccion): {} ms", gap_ms);
     }
 
     let json_out = if use_json || out_bundle.is_some() {

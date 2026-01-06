@@ -28,17 +28,25 @@ Imagen de prueba
 
 Uso rapido
 ```powershell
-cargo run --bin picAnalizer -- uiShow showLandmarks facemodel=1
-cargo run --bin picAnalizer -- uiShow showLandmarks facemodel=2
+cargo run --bin picAnalizer -- uishow showLandmarks facemodel=1
+cargo run --bin picAnalizer -- uishow showLandmarks facemodel=2
 cargo run --bin picAnalizer -- textmode=json facemodel=1 infile=people.jpg
 cargo run --bin picAnalizer -- stages=1 outfile=peopleout.jpg infile=people.jpg
 cargo run --bin webcam_capture -- url=rtsp://mi-camara interval_ms=33
 ```
 
+Ejemplo de imagen (entrada/salida)
+
+Entrada:
+![Entrada](readme-img1.jpg)
+
+Salida:
+![Salida](readme-img1 out.jpg)
+
 Parametros CLI
 - `facemodel=1` -> YuNet (score = cls * obj).
 - `facemodel=2` -> SCRFD (score = cls).  Robusto
-- `uiShow` -> abre ventana con detecciones.
+- `uishow` -> abre ventana con detecciones (case-insensitive, `uiShow` tambien funciona).
 - `showLandmarks` o `showFacialLandmarks` -> dibuja landmarks faciales.
 - `showAll` -> imprime info de inputs/outputs de modelos.
 - `infile=path` -> ruta de imagen (default: people.jpg).
@@ -55,7 +63,7 @@ Parametros CLI
   - fuerza: `textmode=json`, `textmode=0`, `embed=2`, `showLandmarks`
 - `device=cpu|gpu` -> selecciona CPU o GPU (fallback a CPU si no hay EP).
 - `resize=fast|balanced|quality` -> controla calidad/velocidad del resize (default: balanced).
-  - fuerza: `textmode=json`, `textmode=0`, `embed=2`, `showLandmarks`
+  - fast = Nearest, balanced = Bilinear, quality = CatmullRom (fast_image_resize).
 
 Embedding (JSON)
 - En `textmode=json`, los embeddings salen  quantizado como `qint8` en hex concatenado (default) o `raw` con `embed=2`.
@@ -95,7 +103,7 @@ Tiempos por etapa
 - Stage 11: Detection + Embedding (tiempo embedding adicional).
 - Stage 111: Detection + Embedding + Pose (tiempo pose_det y pose_landmarks).
 - Stage 01: solo Embedding (requiere imagen 112x112; no usa Detection).
-- `Tiempo pipeline total` siempre es la suma de las etapas activas.
+- `Tiempo pipeline total` incluye el tiempo de las etapas activas + overhead (I/O y render).
 
 Postprocesos por modelo
 YuNet (facemodel=1)
@@ -239,6 +247,9 @@ CLI Ejemplo Outout JSON   (cargo run --bin picAnalizer -- textmode=json stages=1
     ]
   },
   "pose": {
-    "enabled": false
+    "enabled": true,
+    "det": {"input":"224x224","normalization":"x/255.0","time_ms": 70},
+    "landmarks": {"input":"256x256","normalization":"x/255.0","time_ms": 90},
+    "keypoints_len": 33
   },
-  "pipeline": {"stages": "111", "total_ms": 411}
+  "pipeline": {"stages": "111", "total_ms": 411, "gap_ms": 0}

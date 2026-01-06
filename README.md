@@ -41,7 +41,7 @@ Entrada:
 ![Entrada](readme-img1.jpg)
 
 Salida:
-![Salida](readme-img1 out.jpg)
+![Salida](readme-img1out.jpg)
 
 Parametros CLI
 - `facemodel=1` -> YuNet (score = cls * obj).

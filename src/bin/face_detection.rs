@@ -12,6 +12,7 @@ pub struct Detection {
     pub width: u32,
     pub height: u32,
     pub confidence: f32,
+    #[allow(dead_code)]
     pub class: DetectionClass,
 }
 
@@ -23,7 +24,9 @@ pub enum DetectionClass {
 
 // Detector basado en características simples
 pub struct SimpleDetector {
+    #[allow(dead_code)]
     min_face_size: u32,
+    #[allow(dead_code)]
     min_body_size: u32,
 }
 
@@ -205,3 +208,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     Ok(())
 }
+
+pub fn run_with_args(_args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    main()
+}
+

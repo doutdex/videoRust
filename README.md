@@ -7,9 +7,17 @@ Objetivo
 - Monitor simple de FPS para RTSP en consola.
 
 Estructura
-- `src/main.rs` -> `picAnalizer` (pipeline ONNX principal).
-- `src/bin/webcam_capture.rs` -> monitor simple de FPS en consola (URL configurable).
+- `crates/vision_core` -> libreria core (deteccion/embedding/pose).
+- `crates/vision_ffi` -> wrapper DLL/CDylib (stub base).
+- `src/main.rs` -> router de subcomandos (`vision`).
+- `src/bin/picAnalizer.rs` -> CLI principal que usa `vision_core`.
+- `src/bin/checkRtspFps.rs` -> monitor simple de FPS RTSP en consola SIN VIDEO (URL configurable).
 - `src/bin/face_detection.rs` -> demo simple sin ML (rust puro).
+- `tests/vision_core` -> QA harness para pre/infer/post con salida JSON ordenada.
+
+Documentacion de crates
+- `crates/vision_core/README.md` -> API y uso del pipeline core.
+- `crates/vision_ffi/README.md` -> notas para DLL/FFI.
 
 Requisitos
 - Windows 10/11.
@@ -28,12 +36,24 @@ Imagen de prueba
 
 Uso rapido
 ```powershell
+cargo run -- vision picAnalizer uishow showLandmarks facemodel=1
 cargo run --bin picAnalizer -- uishow showLandmarks facemodel=1
 cargo run --bin picAnalizer -- uishow showLandmarks facemodel=2
 cargo run --bin picAnalizer -- textmode=json facemodel=1 infile=people.jpg
 cargo run --bin picAnalizer -- stages=1 outfile=peopleout.jpg infile=people.jpg
-cargo run --bin webcam_capture -- url=rtsp://mi-camara interval_ms=33
+cargo run --bin checkRtspFps -- url=rtsp://mi-camara interval_ms=33
+cargo run -- vision checkRtspFps url=rtsp://mi-camara interval_ms=33
+cargo run -- vision face_detection
 ```
+
+QA harness (vision_core)
+```powershell
+cargo run --manifest-path tests/vision_core/Cargo.toml -- --model=yunet --infile=people1.jpg
+cargo run --manifest-path tests/vision_core/Cargo.toml -- --model=scrfd --infile=people1.jpg --json
+```
+
+Nota:
+- Si `cargo run` no detecta binario, usa `cargo run --bin vision-core -- vision picAnalizer ...`.
 
 Ejemplo de imagen (entrada/salida)
 
@@ -124,7 +144,7 @@ UI
 - Tecla "Esc" cierra la ventana.
 
 Webcam / RTSP (monitor FPS)
-- El bin `webcam_capture` solo imprime la URL, FPS y timestamp.
+- El bin `checkRtspFps` solo imprime la URL, FPS y timestamp.
 - Cambia la URL con `url=...` en la linea de comandos.
 - Cambia el intervalo con `interval_ms=...` (default 33 ms).
 - En Windows, `Ctrl+C` termina el proceso (exit code 0xc000013a es normal).

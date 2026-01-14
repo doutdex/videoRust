@@ -2,10 +2,15 @@
 name = "vision-core"
 version = "0.1.0"
 edition = "2021"
+default-run = "vision-core"
+
+[workspace]
+members = ["crates/vision_core", "crates/vision_ffi"]
+resolver = "2"
 
 [[bin]]
-name = "webcam_capture"
-path = "src/bin/webcam_capture.rs"
+name = "checkRtspFps"
+path = "src/bin/checkRtspFps.rs"
 
 [[bin]]
 name = "face_detection"
@@ -13,12 +18,11 @@ path = "src/bin/face_detection.rs"
 
 [[bin]]
 name = "picAnalizer"
-path = "src/main.rs"
+path = "src/bin/picAnalizer.rs"
 
 [dependencies]
 anyhow = "1"
 image = "0.25"
 minifb = "0.27"
-ndarray = "0.16.1"
-fast_image_resize = "2"
-ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
+vision_core = { path = "crates/vision_core" }
+ctrlc = "3"

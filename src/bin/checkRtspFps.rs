@@ -1,12 +1,20 @@
-// Monitor simple de FPS con URL (solo consola).
-// Compilar: cargo build --bin webcam_capture --release
-// Ejecutar: cargo run --bin webcam_capture --release -- url=rtsp://... interval_ms=33
+// Monitor simple de FPS con URL RTSP (solo consola).
+// Compilar: cargo build --bin checkRtspFps --release
+// Ejecutar: cargo run --bin checkRtspFps --release -- url=rtsp://... interval_ms=33
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+pub fn run_with_args(args: Vec<String>) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let running_ctrlc = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        running_ctrlc.store(false, Ordering::SeqCst);
+    })
+    .map_err(|err| anyhow::anyhow!("ctrlc handler: {err}"))?;
+
     let url = args
         .iter()
         .find_map(|a| a.strip_prefix("url=").or_else(|| a.strip_prefix("--url=")))
@@ -25,7 +33,7 @@ fn main() -> Result<()> {
     let mut last_tick = Instant::now();
     let mut last_ts_ms: u128;
 
-    loop {
+    while running.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(interval_ms));
         frame_count += 1;
         last_ts_ms = SystemTime::now()
@@ -44,4 +52,12 @@ fn main() -> Result<()> {
             last_tick = Instant::now();
         }
     }
+
+    println!("Salida solicitada, cerrando...");
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn main() -> Result<()> {
+    run_with_args(std::env::args().collect())
 }
